@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-fileguard - mask-based file protection for a single directory (Linux only).
 
-Files in the program's directory whose names match the masks stored in
-template.tbl are locked (mode 000 + chattr +i) and a background inotify
-watcher removes any new file or directory that matches a protected mask.
-Management commands are protected by a PBKDF2-hashed password.
-"""
 
 import argparse
 import ctypes
@@ -35,6 +28,9 @@ LOG = os.path.join(BASE_DIR, "guard.log")
 
 # service files are never touched by masks
 SERVICE_FILES = {os.path.basename(p) for p in (SELF, TEMPLATE, STATE, LOG)}
+
+SERVICE_NAME = "fileguard.service"
+SERVICE_PATH = "/etc/systemd/system/" + SERVICE_NAME
 
 PBKDF2_ITER = 300_000
 WRONG_PASS_DELAY = 2  # seconds; slows down online password guessing
@@ -228,6 +224,28 @@ def daemon_alive(pid):
         return False
 
 
+# --- optional systemd supervision: restarts the watcher if it is killed ---
+def systemctl(*args):
+    return subprocess.run(["systemctl", *args], capture_output=True, text=True)
+
+
+def service_installed():
+    return os.path.exists(SERVICE_PATH)
+
+
+def watcher_alive(state):
+    """Is the watcher running (as a systemd service or as a plain process)?"""
+    if service_installed():
+        return systemctl("is-active", "--quiet", SERVICE_NAME).returncode == 0
+    return daemon_alive(state.get("pid"))
+
+
+def service_cmd(*args):
+    r = systemctl(*args)
+    if r.returncode != 0:
+        raise OSError(r.stderr.strip() or f"systemctl {' '.join(args)} failed")
+
+
 def start_daemon():
     p = subprocess.Popen([sys.executable, SELF, "_daemon"],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -262,6 +280,26 @@ def remove_path(path):
         os.unlink(path)
 
 
+def sweep():
+    """Remove protected names that appeared while the watcher was not running.
+
+    At this point every legitimately protected file is already recorded in
+    state["modes"], so any other name matching a mask was created during the gap.
+    """
+    try:
+        _, masks = read_template()
+    except SystemExit:
+        return
+    locked = read_state().get("modes", {})
+    for name in os.listdir(BASE_DIR):
+        if matches(name, masks) and name not in locked:
+            try:
+                remove_path(os.path.join(BASE_DIR, name))
+                log(f"DENIED: '{name}' appeared while the watcher was down - removed")
+            except OSError as e:
+                log(f"error while sweeping '{name}': {e}")
+
+
 def run_daemon():
     """Watch the directory via inotify and remove any forbidden names as they appear."""
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -277,6 +315,7 @@ def run_daemon():
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     log(f"watcher started (pid={os.getpid()})")
+    sweep()  # watch is already active, so nothing can slip through the gap
     moved_from = {}  # cookie -> old name (used to roll back renames)
 
     while True:
@@ -356,18 +395,25 @@ def cmd_init(args):
 def cmd_on(args):
     _, masks = read_template()
     state = read_state()
-    if state["enabled"] and daemon_alive(state["pid"]):
+    if state["enabled"] and watcher_alive(state):
         print("Protection is already enabled.")
         return
     print("Enabling protection...")
     reconcile(state, masks)
-    state["pid"] = start_daemon()
+    write_state(state)  # the watcher's startup sweep reads the locked-file list from here
+    if service_installed():
+        service_cmd("enable", "--now", SERVICE_NAME)  # also starts at boot
+        state["pid"] = None
+        how = "systemd service"
+    else:
+        state["pid"] = start_daemon()
+        how = f"pid={state['pid']}"
     state["enabled"] = True
     chattr(SELF, "+i")  # the program itself cannot be deleted or replaced either
     write_state(state)
-    log(f"PROTECTION ENABLED (files: {len(state['modes'])}, watcher pid={state['pid']})")
+    log(f"PROTECTION ENABLED (files: {len(state['modes'])}, watcher: {how})")
     print(f"[ok] Protection enabled. Locked files: {len(state['modes'])}, "
-          f"watcher pid={state['pid']}")
+          f"watcher: {how}")
 
 
 def cmd_off(args):
@@ -377,7 +423,10 @@ def cmd_off(args):
         return
     check_password()
     print("Disabling protection...")
-    stop_daemon(state["pid"])
+    if service_installed():
+        service_cmd("disable", "--now", SERVICE_NAME)
+    else:
+        stop_daemon(state["pid"])
     for name in list(state["modes"]):
         unlock_file(name, state)
     if is_immutable(SELF):
@@ -390,11 +439,17 @@ def cmd_off(args):
 
 def cmd_status(args):
     state = read_state()
-    alive = daemon_alive(state.get("pid"))
+    alive = watcher_alive(state)
     _, masks = read_template()
+    if alive and service_installed():
+        watcher = "running (systemd service, auto-restart)"
+    elif alive:
+        watcher = f"running, pid={state['pid']} (no auto-restart)"
+    else:
+        watcher = "not running"
     print(f"Directory:    {BASE_DIR}")
     print(f"Protection:   {'ENABLED' if state['enabled'] else 'disabled'}")
-    print(f"Watcher:      {'running, pid=' + str(state['pid']) if alive else 'not running'}")
+    print(f"Watcher:      {watcher}")
     print(f"Masks:        {len(masks)} (view with: list, password required)")
     print(f"template.tbl: attributes {get_attrs(TEMPLATE)}, "
           f"mode {oct(stat.S_IMODE(os.stat(TEMPLATE).st_mode))}")
@@ -456,13 +511,74 @@ def cmd_passwd(args):
     print("[ok] Password changed.")
 
 
+UNIT_TEMPLATE = """[Unit]
+Description=fileguard watcher ({base})
+After=local-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory={base}
+ExecStart="{python}" "{script}" _daemon
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def cmd_install_service(args):
+    """Run the watcher under systemd so that kill -9 only restarts it."""
+    check_password()
+    if service_installed():
+        die("Service is already installed.")
+    with open(SERVICE_PATH, "w", encoding="utf-8") as f:
+        f.write(UNIT_TEMPLATE.format(base=BASE_DIR, python=sys.executable, script=SELF))
+    os.chmod(SERVICE_PATH, 0o644)
+    state = read_state()
+    try:
+        service_cmd("daemon-reload")
+        if state["enabled"]:  # switch the already running plain process to systemd
+            stop_daemon(state["pid"])
+            service_cmd("enable", "--now", SERVICE_NAME)
+            state["pid"] = None
+            write_state(state)
+    except OSError:
+        os.remove(SERVICE_PATH)  # roll back, do not leave a half-installed unit
+        raise
+    log("systemd service installed")
+    print("[ok] Service installed. It starts with 'on' and restarts the watcher "
+          "within ~1 s if it is killed.")
+
+
+def cmd_remove_service(args):
+    check_password()
+    if not service_installed():
+        die("Service is not installed.")
+    service_cmd("disable", "--now", SERVICE_NAME)
+    os.remove(SERVICE_PATH)
+    service_cmd("daemon-reload")
+    state = read_state()
+    if state["enabled"]:  # keep protection running as a plain process
+        state["pid"] = start_daemon()
+        write_state(state)
+    log("systemd service removed")
+    print("[ok] Service removed.")
+
+
 def cmd_uninstall(args):
     check_password()
     state = read_state()
     if state["enabled"]:
-        stop_daemon(state["pid"])
+        if service_installed():
+            service_cmd("disable", "--now", SERVICE_NAME)
+        else:
+            stop_daemon(state["pid"])
         for name in list(state["modes"]):
             unlock_file(name, state)
+    if service_installed():
+        os.remove(SERVICE_PATH)
+        systemctl("daemon-reload")
     for p in (SELF, TEMPLATE, STATE):
         if os.path.exists(p) and is_immutable(p):
             chattr(p, "-i")
@@ -489,6 +605,9 @@ def main():
     p = sub.add_parser("remove", help="remove a mask (password)")
     p.add_argument("mask")
     sub.add_parser("passwd", help="change password")
+    sub.add_parser("install-service",
+                   help="run the watcher under systemd with auto-restart (password)")
+    sub.add_parser("remove-service", help="remove the systemd service (password)")
     sub.add_parser("uninstall", help="remove all protection")
     sub.add_parser("_daemon", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -501,6 +620,7 @@ def main():
         "init": cmd_init, "on": cmd_on, "off": cmd_off, "status": cmd_status,
         "list": cmd_list, "add": cmd_add, "remove": cmd_remove,
         "passwd": cmd_passwd, "uninstall": cmd_uninstall,
+        "install-service": cmd_install_service, "remove-service": cmd_remove_service,
     }
     try:
         handlers[args.cmd](args)
